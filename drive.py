@@ -16,36 +16,43 @@ from keras.models import load_model
 import h5py
 from keras import __version__ as keras_version
 
+import cv2
+
 sio = socketio.Server()
 app = Flask(__name__)
 model = None
 prev_image_array = None
 
+def normalize_grayscale(image_data):
+    """
+    Normalize the image data with Min-Max scaling to a range of [0.1, 0.9]
+    :param image_data: The image data to be normalized
+    :return: Normalized image data
+    """
+    img_max = np.max(image_data)
+    img_min = np.min(image_data)
+    a = -0.5
+    b = 0.5
 
-class SimplePIController:
-    def __init__(self, Kp, Ki):
-        self.Kp = Kp
-        self.Ki = Ki
-        self.set_point = 0.
-        self.error = 0.
-        self.integral = 0.
+    img_normed = a + (b-a)*(image_data - img_min)/(img_max - img_min)
+    #print(np.max(img_normed))
+    #print(np.min(img_normed))
+    return img_normed
 
-    def set_desired(self, desired):
-        self.set_point = desired
+def normalize_color(image_data):
+    """
+    Normalize the image data on per channel basis.  """
+    img_normed_color = np.zeros_like(image_data, dtype=float)
+    for ch in range(image_data.shape[3]):
+        tmp = normalize_grayscale(image_data[:,:,:,ch])
+        img_normed_color[:,:,:,ch] = tmp
+    #print(np.max(img_normed_color))
+    #print(np.min(img_normed_color))
+    return img_normed_color
 
-    def update(self, measurement):
-        # proportional error
-        self.error = self.set_point - measurement
-
-        # integral error
-        self.integral += self.error
-
-        return self.Kp * self.error + self.Ki * self.integral
-
-
-controller = SimplePIController(0.1, 0.002)
-set_speed = 9
-controller.set_desired(set_speed)
+def normalize(x):
+    # utility function to normalize a tensor by its L2 norm
+    return x / (K.sqrt(K.mean(K.square(x))) + 1e-5)
 
 
 @sio.on('telemetry')
@@ -60,19 +67,64 @@ def telemetry(sid, data):
         # The current image from the center camera of the car
         imgString = data["image"]
         image = Image.open(BytesIO(base64.b64decode(imgString)))
+
         image_array = np.asarray(image)
-        steering_angle = float(model.predict(image_array[None, :, :, :], batch_size=1))
 
-        throttle = controller.update(float(speed))
+        # Crop unnecessary image top lines
+        img_crop = image_array[56:160,:,:]
+        img_resize = cv2.resize(img_crop, (200,66))
+        img_normed = normalize_color(img_resize[None,:,:,:])
 
+        transformed_image_array = img_normed
+
+        steering_angle = float(model.predict(transformed_image_array, batch_size=1))
+        
+        # Speed limits control
+        min_speed = 15 
+        max_speed = 25 
+        if float(speed) < min_speed:
+            throttle = 5.0
+        elif float(speed) > max_speed:
+            throttle = -1.0
+        else:
+            throttle = 5.0
+        
         print(steering_angle, throttle)
         send_control(steering_angle, throttle)
 
         # save frame
         if args.image_folder != '':
+            # Recorded image with right color as using OpenCV (BGR).
+            img_record = cv2.cvtColor(img_resize, cv2.COLOR_RGB2BGR)
+            #print("saving...")
+
             timestamp = datetime.utcnow().strftime('%Y_%m_%d_%H_%M_%S_%f')[:-3]
             image_filename = os.path.join(args.image_folder, timestamp)
-            image.save('{}.jpg'.format(image_filename))
+
+            # Save original image?
+            #image.save('{}.png'.format(image_filename))
+
+            # Draw a line on image to show steering direction
+            if args.draw_steer == 'on':
+                start_x = 100
+                start_y = 66
+                mid_x = 100
+                mid_y = 60
+                end_y = 30
+                end_x = start_x + steering_angle * (start_y - end_y)
+                end_x = int(end_x)
+
+                points_list = []
+                points_list.append((start_x, start_y))
+                points_list.append((mid_x, mid_y))
+                points_list.append((end_x, end_y))
+                cv2.polylines(img_record, [np.array(points_list)], False, (255,0,0), thickness=1, lineType=cv2.LINE_AA)
+
+            # Add steering angle to file name.
+            image_filename = image_filename + '_' + str(steering_angle)
+            # Save angle-annotated image?
+            cv2.imwrite('{}.png'.format(image_filename), img_record)
+ 
     else:
         # NOTE: DON'T EDIT THIS.
         sio.emit('manual', data={}, skip_sid=True)
@@ -108,6 +160,13 @@ if __name__ == '__main__':
         default='',
         help='Path to image folder. This is where the images from the run will be saved.'
     )
+    parser.add_argument(
+        'draw_steer',
+        type=str,
+        nargs='?',
+        default='on',
+        help='Want to draw the steering angle on image? On/off. Default on.'
+    )
     args = parser.parse_args()
 
     # check that model Keras version is same as local Keras version
@@ -117,8 +176,8 @@ if __name__ == '__main__':
 
     if model_version != keras_version:
         print('You are using Keras version ', keras_version,
-              ', but the model was built using ', model_version)
-
+            ', but the model was built using ', model_version)
+        
     model = load_model(args.model)
 
     if args.image_folder != '':
